@@ -163,7 +163,7 @@ def json_state(state):
 def main():
     args = arguments()
     model = MirrorModel(args.mapping)
-    protocol = load_telemetry_reader(args.rmcs_root)
+    protocol = load_telemetry_reader(args.rmcs_root, v2=True)
     if args.url:
         import websockets
         from rosbags.typesys import Stores, get_typestore
@@ -236,7 +236,7 @@ def main():
                 if state["reference_valid"]:
                     rows += [f"gravity difference {state['gravity_error']:.3g} | model coordinate delta {max(abs(v) for v in state['coordinate_error_rad']):.3g} rad"]
                 else:
-                    rows += ["RMCS reference deltas unavailable (estimator invalid); measured pose still updates"]
+                    rows += ["RMCS knee/length comparison unavailable; measured pose still updates"]
                 for i, side in enumerate(("left", "right")):
                     knee = f"{side} inner knee: model {math.degrees(state['knee_rad'][i]):.3f} deg"
                     length = f"{side} leg length: model {state['leg_length_m'][i] * 1000:.2f} mm"

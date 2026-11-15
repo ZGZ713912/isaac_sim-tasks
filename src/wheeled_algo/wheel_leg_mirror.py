@@ -30,7 +30,7 @@ def checked_file(path, expected):
     return path
 
 
-def load_telemetry_reader(rmcs_root):
+def load_telemetry_reader(rmcs_root, *, v2=False):
     """Reuse RMCS's protocol implementation without requiring a ROS install."""
     import importlib.util
     import sys
@@ -42,7 +42,96 @@ def load_telemetry_reader(rmcs_root):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+    if v2:
+        return _state_mirror_protocol(rmcs_root, module)
     return module
+
+
+def _state_mirror_protocol(rmcs_root, legacy):
+    """Keep vehicle checks and the display shape outside the generic transport."""
+    import importlib.util
+    import sys
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    path = Path(rmcs_root) / "rmcs_ws/src/rmcs_rl/tool/mirror/state_mirror_client.py"
+    spec = importlib.util.spec_from_file_location("rmcs_state_mirror_client", path)
+    generic = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = generic
+    spec.loader.exec_module(generic)
+    prefix = "/wheel_leg/telemetry"
+
+    def from_frame(frame):
+        frame.validate()
+        values, names = frame.values, legacy.MOTOR_NAMES
+        if values.get("coordinate") != "rmcs_hardware_output_shaft_v1":
+            raise ValueError("unsupported wheel-leg coordinate")
+        if not set(names).issubset(frame.joints) or frame.imu is None:
+            raise ValueError("wheel-leg mirror requires six chassis joints and an IMU")
+        def numbers(prefix, count):
+            keys = [prefix + str(i) for i in range(count)]
+            return tuple(float(values[k]) for k in keys) if all(k in values for k in keys) else ()
+        def flag(key):
+            value = values.get(key, "unknown")
+            if value not in ("true", "false", "unknown"):
+                raise ValueError("invalid wheel-leg diagnostic flag: " + key)
+            return None if value == "unknown" else value == "true"
+        original_v1 = values.get("record/source_schema") == "wheel_leg_telemetry_v1"
+        positions = numbers("state/position/", 6)
+        gravity = tuple(frame.vectors.get("rl_projected_gravity", ()))
+        available = len(positions) == 6 and len(gravity) == 3
+        ages = tuple(frame.joints[n][2] if frame.joints[n][2] is not None else -1. for n in names)
+        ages += (frame.imu.get("age_s") if frame.imu.get("age_s") is not None else -1.,)
+        offsets = tuple(float(values["model_offset/" + n]) for n in names[:4])
+        gimbal = legacy.GIMBAL_NAMES if all(n in frame.joints for n in legacy.GIMBAL_NAMES) else ()
+        return legacy.Snapshot(frame.stamp_ns, tuple(frame.joints[n][0] for n in names),
+            tuple(frame.imu["quaternion_wxyz"]), tuple(frame.imu["gyro"]), gravity or (0., 0., 0.),
+            tuple(frame.vectors.get("rl_angular_velocity", frame.imu["gyro"])),
+            velocities=tuple(frame.joints[n][1] for n in names),
+            rmcs_knee=numbers("rmcs_knee/", 2), rmcs_length=numbers("rmcs_length/", 2),
+            rmcs_model_positions=positions, model_offsets=offsets,
+            feedback_fresh=flag("feedback_fresh") if original_v1 else all(0. <= a <= .04 for a in ages),
+            state_valid=bool(flag("state_valid")) if original_v1 else available,
+            reset_count=int(values.get("control/reset_count", values.get("reset_count", "0"))),
+            calibration_sha256=values.get("calibration_sha256", ""),
+            calibration_model_spec_sha256=values.get("calibration_model_spec_sha256", ""),
+            sensor_age_s=ages, diagnostic_status=values.get("diagnostic_status", "") if original_v1 else generic.SCHEMA,
+            control_enabled=flag("control/enabled") if not original_v1 else flag("control_enabled"),
+            dm_control_ready=flag("control/ready") if not original_v1 else flag("dm_control_ready"),
+            gimbal_positions=tuple(frame.joints[n][0] for n in gimbal),
+            gimbal_velocities=tuple(frame.joints[n][1] for n in gimbal)).validate()
+
+    class Latest(generic.LatestFrame):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._converted_frame = self._snapshot = None
+
+        def put(self, frame, source=None):
+            if isinstance(frame, legacy.Snapshot):
+                frame = generic.convert_v1(asdict(frame))
+                frame.values["coordinate"] = "rmcs_hardware_output_shaft_v1"
+            super().put(frame, source)
+
+        def get(self):
+            frame, age, status = super().get()
+            if frame is not None and frame is not self._converted_frame:
+                try:
+                    self._snapshot = from_frame(frame)
+                    self._converted_frame = frame
+                except (ValueError, KeyError, TypeError) as error:
+                    return None, age, "invalid wheel-leg frame: " + str(error)
+            return self._snapshot, age, status
+
+    class Reader(generic.FoxgloveReader):
+        def __init__(self, url, latest):
+            super().__init__(url, latest, prefix, "chassis_body")
+
+    def read_record(path, metadata=None):
+        for elapsed, frame in generic.read_record(path, metadata):
+            yield elapsed, from_frame(frame)
+
+    return SimpleNamespace(**{k: getattr(legacy, k) for k in ("Snapshot", "MOTOR_NAMES", "GIMBAL_NAMES")},
+        Frame=generic.Frame, LatestSnapshot=Latest, FoxgloveReader=Reader,
+        ReplayReader=generic.ReplayReader, read_record=read_record, from_frame=from_frame)
 
 
 class MirrorModel:
@@ -127,14 +216,20 @@ class MirrorModel:
 
     def validate_source(self, snapshot):
         snapshot.validate()
-        for name, count in (("velocities", 6), ("rmcs_knee", 2), ("rmcs_length", 2),
-                            ("rmcs_model_positions", 6), ("model_offsets", 4)):
-            if len(getattr(snapshot, name)) != count:
-                raise ValueError(f"missing mirror reference: {name}")
-        calibration = self.mapping["calibration"]
-        for name in ("calibration_sha256", "calibration_model_spec_sha256"):
-            if getattr(snapshot, name) != calibration[name]:
-                raise ValueError(f"real robot {name} differs from mirror mapping")
+        if len(snapshot.velocities) != 6:
+            raise ValueError("missing mirror reference: velocities")
+        references = (("rmcs_knee", 2), ("rmcs_length", 2), ("rmcs_model_positions", 6), ("model_offsets", 4))
+        for name, count in references:
+            size = len(getattr(snapshot, name))
+            if size and size != count:
+                raise ValueError(f"incomplete mirror reference: {name}")
+        if snapshot.diagnostic_status != "rmcs_state_mirror_v2":
+            for name, count in references:
+                if len(getattr(snapshot, name)) != count:
+                    raise ValueError(f"missing mirror reference: {name}")
+            for name in ("calibration_sha256", "calibration_model_spec_sha256"):
+                if getattr(snapshot, name) != self.mapping["calibration"][name]:
+                    raise ValueError(f"real robot {name} differs from mirror mapping")
         offsets = {e["source"]: e["offset_rad"] for e in self.entries if e["sign"] == -1}
         if snapshot.offsets_by_name != offsets:
             raise ValueError("real robot model offsets differ from mirror mapping")
@@ -199,14 +294,15 @@ class MirrorModel:
         gravity = root[:3, :3].T @ np.array([0., 0., -1.])
         gravity_error = float(np.linalg.norm(gravity - snapshot.gravity_rl)) if snapshot.state_valid else None
         coordinate_error = [math.remainder(measured[e["target"]] - snapshot.model_positions_by_name[e["source"]], 2 * math.pi)
-                            for e in self.entries]
+                            for e in self.entries] if snapshot.state_valid else None
+        reference_valid = snapshot.state_valid and len(snapshot.rmcs_knee) == 2 and len(snapshot.rmcs_length) == 2
         self.previous, self.epoch = q, snapshot.reset_count
         return dict(joint_positions=measured,
                     body_frames={name: root @ pose for name, pose in frames.items()},
                     knee_rad=knees, leg_length_m=lengths, wheel_centers_body_m=wheels,
-                    knee_error_rad=(np.asarray(knees) - snapshot.rmcs_knee).tolist() if snapshot.state_valid else None,
-                    leg_length_error_m=(np.asarray(lengths) - snapshot.rmcs_length).tolist() if snapshot.state_valid else None,
+                    knee_error_rad=(np.asarray(knees) - snapshot.rmcs_knee).tolist() if reference_valid else None,
+                    leg_length_error_m=(np.asarray(lengths) - snapshot.rmcs_length).tolist() if reference_valid else None,
                     coordinate_error_rad=coordinate_error if snapshot.state_valid else None, gravity_error=gravity_error,
-                    reference_valid=snapshot.state_valid, diagnostic_warnings=warnings,
+                    reference_valid=reference_valid, diagnostic_warnings=warnings,
                     closure_error_m=error, stamp_ns=snapshot.stamp_ns,
                     fixed_base_position_m=list(base_position), unmeasured_gimbal="nominal zero")

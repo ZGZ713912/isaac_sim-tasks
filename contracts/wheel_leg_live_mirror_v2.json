@@ -1,0 +1,28 @@
+{
+  "schema": "wheel_leg_live_mirror_v2",
+  "mapping_contract": "wheel_leg_live_mirror_v1.json",
+  "telemetry_schema": "rmcs_state_mirror_v2",
+  "record_schema": "rmcs_state_mirror_record_v2",
+  "legacy_record_schema": "wheel_leg_mirror_record_v1",
+  "topic_prefix": "/wheel_leg/telemetry",
+  "frame_id": "chassis_body",
+  "required_joint_names": [
+    "left_hip_joint",
+    "left_knee_joint",
+    "right_hip_joint",
+    "right_knee_joint",
+    "left_wheel",
+    "right_wheel"
+  ],
+  "required_imu": true,
+  "maximum_sensor_age_s": 0.04,
+  "source_coordinate": "rmcs_hardware_output_shaft_v1",
+  "optional_comparisons": [
+    "passive_knee",
+    "leg_length",
+    "state/position",
+    "rl_projected_gravity"
+  ],
+  "absent_comparison": "unavailable; independent measured-pose reconstruction continues",
+  "identity_note": "v1 mapping bytes remain unchanged so existing recording mapping_sha256 remains valid"
+}
