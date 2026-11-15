@@ -13,12 +13,42 @@ sys.path.insert(0,str(ROOT/"src"))
 from wheeled_tasks.wheelbipe_port.training_contract import check_constraint_gap
 
 
+def generic_path(path, roots=()):
+    resolved = Path(path).resolve()
+    for name, base in [("isaac_wheeled_rl_train", ROOT), *roots]:
+        if resolved.is_relative_to(base):
+            return name + ":" + resolved.relative_to(base).as_posix()
+    raise ValueError("Path has no repository mapping; provide --path-root NAME=DIR")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint",type=Path,required=True)
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--allow-pilot",action="store_true",help="Permit diagnostic exports before the full budget")
+    parser.add_argument("--rmcs-contract", type=Path)
+    parser.add_argument("--gas-model", type=Path)
+    parser.add_argument("--path-root", action="append", default=[], metavar="NAME=DIR")
     args = parser.parse_args()
+    if bool(args.rmcs_contract) != bool(args.gas_model):
+        parser.error("--rmcs-contract and --gas-model must be supplied together")
+    roots = []
+    for mapping in args.path_root:
+        name, separator, directory = mapping.partition("=")
+        if not separator or not name or any(c in name for c in ":/\\"):
+            parser.error("--path-root requires NAME=DIR with a repository name")
+        roots.append((name, Path(directory).resolve()))
+
+    path_name = lambda path: generic_path(path, roots)
+
+    def generic_values(value):
+        if isinstance(value, dict):
+            return {k: generic_values(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [generic_values(v) for v in value]
+        if isinstance(value, str) and Path(value).is_absolute():
+            return path_name(value)
+        return value
     import numpy as np
     import torch
     import onnx
@@ -49,6 +79,14 @@ def main():
     normalization = {k:v for k,v in state.items() if "obs_normalizer" in k}
     if normalization:
         raise ValueError("This source actor unexpectedly contains observation normalization")
+    checkpoint_path = path_name(source)
+    rmcs_contract = json.loads(args.rmcs_contract.read_text()) if args.rmcs_contract else None
+    header = None
+    if rmcs_contract is not None:
+        from generate_jump_policy_header import generate
+        header = generate(rmcs_contract, args.gas_model.read_bytes())
+        path_name(args.rmcs_contract)
+        path_name(args.gas_model)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True,exist_ok=False)
     target = args.output/"policy.onnx"
@@ -64,7 +102,38 @@ def main():
     error = float(np.max(np.abs(actual-expected)))
     if not np.allclose(actual,expected,rtol=1e-5,atol=1e-5):
         raise ValueError(f"ONNX actor parity failed: {error}")
-    contract = dict(schema="wheelbipe-v202-onnx-contract-v1",checkpoint=str(source),
+    metadata = {}
+    header_sha = None
+    if rmcs_contract is not None:
+        model = onnx.load(str(target))
+        graph = model.graph.SerializeToString()
+        metadata = {entry.key: entry.value for entry in model.metadata_props}
+        policy_hz = rmcs_contract["policy_hz"]
+        if int(policy_hz) != policy_hz or policy_hz <= 0:
+            raise ValueError("RMCS policy_hz must be a positive integer")
+        metadata.update({
+            "wheelbipe_deployment_contract_sha256": rmcs_contract["deployment_contract_sha256"],
+            "rmcs_observation_contract_sha256": rmcs_contract["observation_contract_sha256"],
+            "leg_target_model_spec_sha256": rmcs_contract["model_spec_sha256"],
+            "rmcs_observation_version": rmcs_contract["observation_version"],
+            "rmcs_obs_normalization": "none",
+            "policy_hz": str(int(policy_hz)),
+            "pilot": "true" if args.allow_pilot else "false",
+            "rmcs_checkpoint_sha256": hashlib.sha256(content).hexdigest(),
+        })
+        onnx.helper.set_model_props(model, metadata)
+        onnx.checker.check_model(model)
+        onnx.save(model, str(target))
+        if onnx.load(str(target)).graph.SerializeToString() != graph:
+            raise ValueError("Writing metadata changed the ONNX graph")
+        restamped = ort.InferenceSession(str(target), providers=["CPUExecutionProvider"])
+        final = restamped.run(None, {"obs": sample})[0]
+        if actual.tobytes() != final.tobytes():
+            raise ValueError("Writing metadata changed inference values")
+        header_path = args.output / "jump_policy.hpp"
+        header_path.write_text(header)
+        header_sha = hashlib.sha256(header_path.read_bytes()).hexdigest()
+    contract = dict(schema="wheelbipe-v202-onnx-contract-v1",checkpoint=checkpoint_path,
         checkpoint_sha256=hashlib.sha256(content).hexdigest(),
         onnx_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),completed_updates=receipt["completed_updates"],
         source_snapshot_sha256=receipt["source_snapshot_sha256"],
@@ -80,6 +149,15 @@ def main():
         postprocessing="leg defaults + 0.5*action; wheels 10*action rad/s; v202 PD, physical spring, limits and measured wheel response required; cancellation FF is selected by native.gas_cancellation_feedforward",
         gas_cancellation_feedforward=receipt["native"].get("gas_cancellation_feedforward",True),
         deployment_requires_matching_low_level_control=True)
+    if rmcs_contract is not None:
+        contract.update(
+            rmcs_contract=dict(path=path_name(args.rmcs_contract),
+                sha256=hashlib.sha256(args.rmcs_contract.read_bytes()).hexdigest()),
+            gas_model=dict(path=path_name(args.gas_model),
+                sha256=hashlib.sha256(args.gas_model.read_bytes()).hexdigest()),
+            header_sha256=header_sha, metadata=metadata, metadata_graph_unchanged=True,
+            metadata_bitwise_parity_samples=len(sample), pilot=bool(args.allow_pilot))
+    contract = generic_values(contract)
     # The textual order above is checked against dimensions rather than being
     # used as executable preprocessing; exact per-field scales remain in YAML.
     (args.output/"contract.json").write_text(json.dumps(contract,indent=2)+"\n")
